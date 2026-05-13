@@ -5,6 +5,7 @@
 #include "llama.h"
 #include "chat.h"
 #include "mtmd.h"
+#include "mtmd-helper.h"
 
 #define JSON_ASSERT GGML_ASSERT
 #include <nlohmann/json.hpp>
@@ -183,6 +184,8 @@ public:
     // appends server tokens, updates the media map. copies media chunks.
     void push_back(server_tokens & tokens);
 
+    bool has_media() const { return !map_idx_to_media.empty(); }
+
     // for compatibility with context shift and prompt truncation
     void insert(const llama_tokens & inp_tokens);
 
@@ -217,7 +220,9 @@ public:
                 size_t idx,
                 llama_pos pos,
                 int32_t seq_id,
-                size_t & n_tokens_out) const;
+                size_t & n_tokens_out,
+                mtmd_helper_eval_batch_callback callback = nullptr,
+                void * callback_user_data = nullptr) const;
 
     server_tokens clone() const;
 };

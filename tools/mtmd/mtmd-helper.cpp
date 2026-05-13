@@ -233,7 +233,7 @@ struct decode_embd_batch {
 };
 
 // Helper function for decoding an image whose embeddings have already been calculated
-int32_t mtmd_helper_decode_image_chunk(
+static int32_t mtmd_helper_decode_image_chunk_impl(
         mtmd_context * ctx,
         struct llama_context * lctx,
         const mtmd_input_chunk * chunk,
@@ -241,7 +241,9 @@ int32_t mtmd_helper_decode_image_chunk(
         llama_pos n_past,
         llama_seq_id seq_id,
         int32_t n_batch,
-        llama_pos * new_n_past) {
+        llama_pos * new_n_past,
+        mtmd_helper_eval_batch_callback callback,
+        void * callback_user_data) {
     GGML_ASSERT(n_batch > 0);
     auto chunk_type = mtmd_input_chunk_get_type(chunk);
     const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "image" : "audio";
@@ -300,6 +302,14 @@ int32_t mtmd_helper_decode_image_chunk(
             return ret;
         }
 
+        if (callback) {
+            ret = callback(callback_user_data, &batch_embd_view);
+            if (ret != 0) {
+                llama_set_causal_attn(lctx, true); // restore causal attn
+                return ret;
+            }
+        }
+
         LOG_INF("%s decoded (batch %d/%d) in %" PRId64 " ms\n", name, i_batch+1, n_img_batches, ggml_time_ms() - t1);
 
         i_batch++;
@@ -314,14 +324,28 @@ int32_t mtmd_helper_decode_image_chunk(
     return 0;
 }
 
-int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
+int32_t mtmd_helper_decode_image_chunk(
+        mtmd_context * ctx,
+        struct llama_context * lctx,
+        const mtmd_input_chunk * chunk,
+        float * encoded_embd,
+        llama_pos n_past,
+        llama_seq_id seq_id,
+        int32_t n_batch,
+        llama_pos * new_n_past) {
+    return mtmd_helper_decode_image_chunk_impl(ctx, lctx, chunk, encoded_embd, n_past, seq_id, n_batch, new_n_past, nullptr, nullptr);
+}
+
+int32_t mtmd_helper_eval_chunk_single_with_callback(mtmd_context * ctx,
         struct llama_context * lctx,
         const mtmd_input_chunk * chunk,
         llama_pos n_past,
         llama_seq_id seq_id,
         int32_t n_batch,
         bool logits_last,
-        llama_pos * new_n_past) {
+        llama_pos * new_n_past,
+        mtmd_helper_eval_batch_callback callback,
+        void * callback_user_data) {
     GGML_ASSERT(n_batch > 0);
     int32_t ret;
     llama_batch text_batch = llama_batch_init(n_batch, 0, 1);
@@ -354,6 +378,13 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
                 llama_batch_free(text_batch);
                 return ret;
             }
+            if (callback) {
+                ret = callback(callback_user_data, &text_batch);
+                if (ret != 0) {
+                    llama_batch_free(text_batch);
+                    return ret;
+                }
+            }
             *new_n_past += text_batch.n_tokens;
         }
 
@@ -373,7 +404,7 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
         LOG_INF("%s slice encoded in %" PRId64 " ms\n", name, ggml_time_ms() - t0);
 
         float * embd = mtmd_get_output_embd(ctx);
-        ret = mtmd_helper_decode_image_chunk(ctx, lctx, chunk, embd, n_past, seq_id, n_batch, new_n_past);
+        ret = mtmd_helper_decode_image_chunk_impl(ctx, lctx, chunk, embd, n_past, seq_id, n_batch, new_n_past, callback, callback_user_data);
         if (ret != 0) {
             LOG_ERR("failed to decode %s\n", name);
             llama_batch_free(text_batch);
@@ -385,6 +416,17 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
 
     llama_batch_free(text_batch);
     return 0;
+}
+
+int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
+        struct llama_context * lctx,
+        const mtmd_input_chunk * chunk,
+        llama_pos n_past,
+        llama_seq_id seq_id,
+        int32_t n_batch,
+        bool logits_last,
+        llama_pos * new_n_past) {
+    return mtmd_helper_eval_chunk_single_with_callback(ctx, lctx, chunk, n_past, seq_id, n_batch, logits_last, new_n_past, nullptr, nullptr);
 }
 
 int32_t mtmd_helper_eval_chunks(mtmd_context * ctx,

@@ -51,6 +51,8 @@ MTMD_API llama_pos mtmd_helper_get_n_pos(const mtmd_input_chunks * chunks);
 // out_pos must have length == mtmd_helper_get_n_tokens(image)
 MTMD_API void mtmd_helper_image_get_decoder_pos(const mtmd_image_tokens * image, mtmd_decoder_pos * out_pos);
 
+typedef int32_t (*mtmd_helper_eval_batch_callback)(void * user_data, const struct llama_batch * batch);
+
 // helper function that automatically:
 // 1. run llama_decode() on text chunks
 // 2. run mtmd_encode() on image chunks, then mtmd_get_output_embd() and then llama_decode()
@@ -76,6 +78,20 @@ MTMD_API int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
                                                int32_t n_batch,
                                                bool logits_last,
                                                llama_pos * new_n_past);
+
+// works like mtmd_helper_eval_chunk_single(), but calls callback after each
+// successful llama_decode() batch. If the callback returns non-zero, evaluation
+// stops and that status is returned.
+MTMD_API int32_t mtmd_helper_eval_chunk_single_with_callback(mtmd_context * ctx,
+                                                             struct llama_context * lctx,
+                                                             const mtmd_input_chunk * chunk,
+                                                             llama_pos n_past,
+                                                             llama_seq_id seq_id,
+                                                             int32_t n_batch,
+                                                             bool logits_last,
+                                                             llama_pos * new_n_past,
+                                                             mtmd_helper_eval_batch_callback callback,
+                                                             void * callback_user_data);
 
 // helper function to decode an image whose embeddings have already been calculated
 // this helper will handle batching and pre/post decoding setup (for ex. gemma 3 requires non-causal attention)

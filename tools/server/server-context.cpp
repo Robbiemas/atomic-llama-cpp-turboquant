@@ -260,7 +260,15 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        if (!spec || !task) {
+            return false;
+        }
+
+        if (task->params.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) {
+            return true;
+        }
+
+        return !task->tokens.has_media() && !prompt.tokens.has_media();
     }
 
     void add_token(const completion_token_output & token) {
@@ -455,6 +463,21 @@ struct server_slot {
         other.init_sampler();
     }
 };
+
+struct server_mtp_media_warmup {
+    server_slot * slot;
+};
+
+static int32_t server_mtp_media_warmup_callback(void * user_data, const llama_batch * batch) {
+    auto * warmup = static_cast<server_mtp_media_warmup *>(user_data);
+
+    if (!warmup || !warmup->slot || !warmup->slot->spec || !batch || batch->n_tokens <= 0) {
+        return 0;
+    }
+
+    common_speculative_set_h_idx(warmup->slot->spec, batch->n_tokens - 1);
+    return 0;
+}
 
 
 
@@ -734,8 +757,7 @@ private:
             }
 
             if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
-                params_base.speculative.type =  COMMON_SPECULATIVE_TYPE_NONE;
-                SRV_WRN("%s\n", "speculative decoding is not supported by multimodal, it will be disabled");
+                SRV_WRN("%s\n", "multimodal projector loaded with speculative decoding; MTP can draft media prompts, other speculation types remain text-only");
             }
         }
 
@@ -794,10 +816,6 @@ private:
             if (can_spec) {
                 slot.spec = common_speculative_init(params_base.speculative, slot.ctx);
                 if (slot.spec) {
-                    if (mctx) {
-                        SRV_ERR("%s\n", "speculative decoding is not supported with multimodal");
-                        return false;
-                    }
                     // MTP reads target's KV memory by sequence id; bind to slot.id (server uses slot.id as seq_id).
                     common_speculative_set_seq_id(slot.spec, slot.id);
                     SLT_INF(slot, "%s", "speculative decoding context initialized\n");
@@ -2113,12 +2131,9 @@ private:
             //       perform the speculative drafting for all sequences at the same time in a single batch
             const int n_draft_max = slot.get_n_draft_max();
             if (n_draft_max > 0) {
-                if (mctx) {
-                    // we should never reach this, as speculative is automatically disabled if mmproj is loaded
-                    GGML_ABORT("not supported by multimodal");
-                }
-
-                const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
+                static const llama_tokens empty_prompt;
+                const bool slot_mtp = slot.task->params.speculative.type == COMMON_SPECULATIVE_TYPE_MTP;
+                const llama_tokens & cached_text_tokens = slot_mtp ? empty_prompt : slot.prompt.tokens.get_text_tokens();
 
                 const auto & params_spec = slot.task->params.speculative;
 
@@ -2544,7 +2559,18 @@ private:
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
                         // process the image
                         size_t n_tokens_out = 0;
-                        int32_t res = input_tokens.process_chunk(ctx, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
+                        const bool mtp_active =
+                            slot.spec != nullptr &&
+                            slot.task->params.speculative.type == COMMON_SPECULATIVE_TYPE_MTP;
+                        server_mtp_media_warmup mtp_warmup{&slot};
+
+                        if (mtp_active) {
+                            llama_set_embeddings(ctx, true);
+                        }
+
+                        int32_t res = input_tokens.process_chunk(ctx, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out,
+                            mtp_active ? server_mtp_media_warmup_callback : nullptr,
+                            mtp_active ? &mtp_warmup : nullptr);
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
                             send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
@@ -2878,7 +2904,14 @@ private:
                     slot.state = SLOT_STATE_GENERATING;
 
                     if (slot.can_speculate()) {
-                        common_speculative_begin(slot.spec, slot.prompt.tokens.get_text_tokens());
+                        static const llama_tokens empty_prompt;
+                        const bool slot_mtp = slot.task->params.speculative.type == COMMON_SPECULATIVE_TYPE_MTP;
+
+                        if (slot_mtp) {
+                            common_speculative_set_h_idx(slot.spec, slot.i_batch - i);
+                        }
+
+                        common_speculative_begin(slot.spec, slot_mtp ? empty_prompt : slot.prompt.tokens.get_text_tokens());
                     }
                 } else if (slot.state != SLOT_STATE_GENERATING) {
                     continue; // continue loop of slots
@@ -2969,7 +3002,9 @@ private:
                 slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
 
                 // add accepted tokens to the prompt
-                slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
+                for (auto it = ids.begin(); it != ids.end() - 1; ++it) {
+                    slot.prompt.tokens.push_back(*it);
+                }
                 slot.sampled = ids.back(); // last accepted token
 
                 llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
