@@ -379,17 +379,17 @@ void server_tokens::push_back(server_tokens & tokens) {
 }
 
 void server_tokens::insert(const llama_tokens & inp_tokens) {
-    GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
+    GGML_ASSERT(!has_mtmd || !has_media()); // text-only MTMD prompts can still use token-only operations
     tokens.insert(tokens.end(), inp_tokens.begin(), inp_tokens.end());
 }
 
 const llama_tokens & server_tokens::get_text_tokens() const {
-    GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
+    GGML_ASSERT(!has_mtmd || !has_media()); // only allow this if no media chunks are present
     return tokens;
 }
 
 void server_tokens::set_token(llama_pos pos, llama_token id) {
-    GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
+    GGML_ASSERT(!has_mtmd || !has_media()); // text-only MTMD prompts can still use token-only operations
     tokens[pos] = id;
 }
 
@@ -515,7 +515,9 @@ int32_t server_tokens::process_chunk(
             size_t idx,
             llama_pos pos,
             int32_t seq_id,
-            size_t & n_tokens_out) const {
+            size_t & n_tokens_out,
+            mtmd_helper_eval_batch_callback callback,
+            void * callback_user_data) const {
     const auto & chunk = find_chunk(idx);
     const char * name = mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_IMAGE
                         ? "image" : "audio";
@@ -523,13 +525,15 @@ int32_t server_tokens::process_chunk(
     int32_t n_batch = llama_n_batch(ctx);
     int64_t t0 = ggml_time_ms();
     llama_pos new_n_past; // unused for now
-    int32_t result = mtmd_helper_eval_chunk_single(mctx, ctx,
+    int32_t result = mtmd_helper_eval_chunk_single_with_callback(mctx, ctx,
         chunk.get(),
         pos,
         seq_id,
         n_batch,
         true, // logits last
-        &new_n_past);
+        &new_n_past,
+        callback,
+        callback_user_data);
     SRV_INF("%s processed in %" PRId64 " ms\n", name, ggml_time_ms() - t0);
     if (result != 0) {
         LOG_ERR("mtmd_helper_eval failed with status %d", result);
